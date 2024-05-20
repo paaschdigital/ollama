@@ -69,7 +69,7 @@
     "webpack-dev-server": "^4.15.1"
   },
   "dependencies": {
-    "@electron/remote": "^2.0.10",
+    "@electron/remote": "^2.1.2",
     "@heroicons/react": "^2.0.18",
     "@segment/analytics-node": "^1.0.0",
     "copy-to-clipboard": "^3.3.3",
