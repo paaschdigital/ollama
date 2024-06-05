@@ -6,6 +6,8 @@ Install required tools:
 - go version 1.22 or higher
 - gcc version 11.4.0 or higher
 
+### MacOS
+
 ```bash
 brew install go cmake gcc
 ```
@@ -51,7 +53,7 @@ Typically the build scripts will auto-detect CUDA, however, if your Linux distro
 or installation approach uses unusual paths, you can specify the location by
 specifying an environment variable `CUDA_LIB_DIR` to the location of the shared
 libraries, and `CUDACXX` to the location of the nvcc compiler. You can customize
-set set of target CUDA architectues by setting `CMAKE_CUDA_ARCHITECTURES` (e.g. "50;60;70")
+a set of target CUDA architectures by setting `CMAKE_CUDA_ARCHITECTURES` (e.g. "50;60;70")
 
 Then generate dependencies:
 

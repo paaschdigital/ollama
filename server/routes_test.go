@@ -15,11 +15,34 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/version"
 )
+
+func createTestFile(t *testing.T, name string) string {
+	t.Helper()
+
+	f, err := os.CreateTemp(t.TempDir(), name)
+	require.NoError(t, err)
+	defer f.Close()
+
+	err = binary.Write(f, binary.LittleEndian, []byte("GGUF"))
+	require.NoError(t, err)
+
+	err = binary.Write(f, binary.LittleEndian, uint32(3))
+	require.NoError(t, err)
+
+	err = binary.Write(f, binary.LittleEndian, uint64(0))
+	require.NoError(t, err)
+
+	err = binary.Write(f, binary.LittleEndian, uint64(0))
+	require.NoError(t, err)
+
+	return f.Name()
+}
 
 func Test_Routes(t *testing.T) {
 	type testCase struct {
@@ -30,39 +53,17 @@ func Test_Routes(t *testing.T) {
 		Expected func(t *testing.T, resp *http.Response)
 	}
 
-	createTestFile := func(t *testing.T, name string) string {
-		t.Helper()
-
-		f, err := os.CreateTemp(t.TempDir(), name)
-		assert.Nil(t, err)
-		defer f.Close()
-
-		err = binary.Write(f, binary.LittleEndian, []byte("GGUF"))
-		assert.Nil(t, err)
-
-		err = binary.Write(f, binary.LittleEndian, uint32(3))
-		assert.Nil(t, err)
-
-		err = binary.Write(f, binary.LittleEndian, uint64(0))
-		assert.Nil(t, err)
-
-		err = binary.Write(f, binary.LittleEndian, uint64(0))
-		assert.Nil(t, err)
-
-		return f.Name()
-	}
-
 	createTestModel := func(t *testing.T, name string) {
 		fname := createTestFile(t, "ollama-model")
 
-		modelfile := strings.NewReader(fmt.Sprintf("FROM %s\nPARAMETER seed 42\nPARAMETER top_p 0.9\nPARAMETER stop foo\nPARAMETER stop bar", fname))
-		commands, err := parser.Parse(modelfile)
-		assert.Nil(t, err)
+		r := strings.NewReader(fmt.Sprintf("FROM %s\nPARAMETER seed 42\nPARAMETER top_p 0.9\nPARAMETER stop foo\nPARAMETER stop bar", fname))
+		modelfile, err := parser.ParseFile(r)
+		require.NoError(t, err)
 		fn := func(resp api.ProgressResponse) {
 			t.Logf("Status: %s", resp.Status)
 		}
-		err = CreateModel(context.TODO(), name, "", "", commands, fn)
-		assert.Nil(t, err)
+		err = CreateModel(context.TODO(), name, "", "", modelfile, fn)
+		require.NoError(t, err)
 	}
 
 	testCases := []testCase{
@@ -74,9 +75,9 @@ func Test_Routes(t *testing.T) {
 			},
 			Expected: func(t *testing.T, resp *http.Response) {
 				contentType := resp.Header.Get("Content-Type")
-				assert.Equal(t, contentType, "application/json; charset=utf-8")
+				assert.Equal(t, "application/json; charset=utf-8", contentType)
 				body, err := io.ReadAll(resp.Body)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, fmt.Sprintf(`{"version":"%s"}`, version.Version), string(body))
 			},
 		},
@@ -86,16 +87,17 @@ func Test_Routes(t *testing.T) {
 			Path:   "/api/tags",
 			Expected: func(t *testing.T, resp *http.Response) {
 				contentType := resp.Header.Get("Content-Type")
-				assert.Equal(t, contentType, "application/json; charset=utf-8")
+				assert.Equal(t, "application/json; charset=utf-8", contentType)
 				body, err := io.ReadAll(resp.Body)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 
 				var modelList api.ListResponse
 
 				err = json.Unmarshal(body, &modelList)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 
-				assert.Equal(t, 0, len(modelList.Models))
+				assert.NotNil(t, modelList.Models)
+				assert.Empty(t, len(modelList.Models))
 			},
 		},
 		{
@@ -107,16 +109,16 @@ func Test_Routes(t *testing.T) {
 			},
 			Expected: func(t *testing.T, resp *http.Response) {
 				contentType := resp.Header.Get("Content-Type")
-				assert.Equal(t, contentType, "application/json; charset=utf-8")
+				assert.Equal(t, "application/json; charset=utf-8", contentType)
 				body, err := io.ReadAll(resp.Body)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 
 				var modelList api.ListResponse
 				err = json.Unmarshal(body, &modelList)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 
-				assert.Equal(t, 1, len(modelList.Models))
-				assert.Equal(t, modelList.Models[0].Name, "test-model:latest")
+				assert.Len(t, modelList.Models, 1)
+				assert.Equal(t, "test-model:latest", modelList.Models[0].Name)
 			},
 		},
 		{
@@ -124,18 +126,16 @@ func Test_Routes(t *testing.T) {
 			Method: http.MethodPost,
 			Path:   "/api/create",
 			Setup: func(t *testing.T, req *http.Request) {
-				f, err := os.CreateTemp(t.TempDir(), "ollama-model")
-				assert.Nil(t, err)
-				defer f.Close()
+				fname := createTestFile(t, "ollama-model")
 
 				stream := false
 				createReq := api.CreateRequest{
 					Name:      "t-bone",
-					Modelfile: fmt.Sprintf("FROM %s", f.Name()),
+					Modelfile: fmt.Sprintf("FROM %s", fname),
 					Stream:    &stream,
 				}
 				jsonData, err := json.Marshal(createReq)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 
 				req.Body = io.NopCloser(bytes.NewReader(jsonData))
 			},
@@ -143,11 +143,11 @@ func Test_Routes(t *testing.T) {
 				contentType := resp.Header.Get("Content-Type")
 				assert.Equal(t, "application/json", contentType)
 				_, err := io.ReadAll(resp.Body)
-				assert.Nil(t, err)
-				assert.Equal(t, resp.StatusCode, 200)
+				require.NoError(t, err)
+				assert.Equal(t, 200, resp.StatusCode)
 
 				model, err := GetModel("t-bone")
-				assert.Nil(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, "t-bone:latest", model.ShortName)
 			},
 		},
@@ -162,13 +162,13 @@ func Test_Routes(t *testing.T) {
 					Destination: "beefsteak",
 				}
 				jsonData, err := json.Marshal(copyReq)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 
 				req.Body = io.NopCloser(bytes.NewReader(jsonData))
 			},
 			Expected: func(t *testing.T, resp *http.Response) {
 				model, err := GetModel("beefsteak")
-				assert.Nil(t, err)
+				require.NoError(t, err)
 				assert.Equal(t, "beefsteak:latest", model.ShortName)
 			},
 		},
@@ -180,18 +180,18 @@ func Test_Routes(t *testing.T) {
 				createTestModel(t, "show-model")
 				showReq := api.ShowRequest{Model: "show-model"}
 				jsonData, err := json.Marshal(showReq)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 				req.Body = io.NopCloser(bytes.NewReader(jsonData))
 			},
 			Expected: func(t *testing.T, resp *http.Response) {
 				contentType := resp.Header.Get("Content-Type")
-				assert.Equal(t, contentType, "application/json; charset=utf-8")
+				assert.Equal(t, "application/json; charset=utf-8", contentType)
 				body, err := io.ReadAll(resp.Body)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 
 				var showResp api.ShowResponse
 				err = json.Unmarshal(body, &showResp)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 
 				var params []string
 				paramsSplit := strings.Split(showResp.Parameters, "\n")
@@ -210,34 +210,110 @@ func Test_Routes(t *testing.T) {
 		},
 	}
 
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
 	s := &Server{}
 	router := s.GenerateRoutes()
 
 	httpSrv := httptest.NewServer(router)
 	t.Cleanup(httpSrv.Close)
 
-	workDir, err := os.MkdirTemp("", "ollama-test")
-	assert.Nil(t, err)
-	defer os.RemoveAll(workDir)
-	os.Setenv("OLLAMA_MODELS", workDir)
-
 	for _, tc := range testCases {
-		t.Logf("Running Test: [%s]", tc.Name)
-		u := httpSrv.URL + tc.Path
-		req, err := http.NewRequestWithContext(context.TODO(), tc.Method, u, nil)
-		assert.Nil(t, err)
+		t.Run(tc.Name, func(t *testing.T) {
+			u := httpSrv.URL + tc.Path
+			req, err := http.NewRequestWithContext(context.TODO(), tc.Method, u, nil)
+			require.NoError(t, err)
 
-		if tc.Setup != nil {
-			tc.Setup(t, req)
-		}
+			if tc.Setup != nil {
+				tc.Setup(t, req)
+			}
 
-		resp, err := httpSrv.Client().Do(req)
-		assert.Nil(t, err)
-		defer resp.Body.Close()
+			resp, err := httpSrv.Client().Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
 
-		if tc.Expected != nil {
-			tc.Expected(t, resp)
-		}
+			if tc.Expected != nil {
+				tc.Expected(t, resp)
+			}
+		})
+	}
+}
 
+func TestCase(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	cases := []string{
+		"mistral",
+		"llama3:latest",
+		"library/phi3:q4_0",
+		"registry.ollama.ai/library/gemma:q5_K_M",
+		// TODO: host:port currently fails on windows (#4107)
+		// "localhost:5000/alice/bob:latest",
+	}
+
+	var s Server
+	for _, tt := range cases {
+		t.Run(tt, func(t *testing.T) {
+			w := createRequest(t, s.CreateModelHandler, api.CreateRequest{
+				Name:      tt,
+				Modelfile: fmt.Sprintf("FROM %s", createBinFile(t)),
+				Stream:    &stream,
+			})
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected status 200 got %d", w.Code)
+			}
+
+			expect, err := json.Marshal(map[string]string{"error": "a model with that name already exists"})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Run("create", func(t *testing.T) {
+				w = createRequest(t, s.CreateModelHandler, api.CreateRequest{
+					Name:      strings.ToUpper(tt),
+					Modelfile: fmt.Sprintf("FROM %s", createBinFile(t)),
+					Stream:    &stream,
+				})
+
+				if w.Code != http.StatusBadRequest {
+					t.Fatalf("expected status 500 got %d", w.Code)
+				}
+
+				if !bytes.Equal(w.Body.Bytes(), expect) {
+					t.Fatalf("expected error %s got %s", expect, w.Body.String())
+				}
+			})
+
+			t.Run("pull", func(t *testing.T) {
+				w := createRequest(t, s.PullModelHandler, api.PullRequest{
+					Name:   strings.ToUpper(tt),
+					Stream: &stream,
+				})
+
+				if w.Code != http.StatusBadRequest {
+					t.Fatalf("expected status 500 got %d", w.Code)
+				}
+
+				if !bytes.Equal(w.Body.Bytes(), expect) {
+					t.Fatalf("expected error %s got %s", expect, w.Body.String())
+				}
+			})
+
+			t.Run("copy", func(t *testing.T) {
+				w := createRequest(t, s.CopyModelHandler, api.CopyRequest{
+					Source:      tt,
+					Destination: strings.ToUpper(tt),
+				})
+
+				if w.Code != http.StatusBadRequest {
+					t.Fatalf("expected status 500 got %d", w.Code)
+				}
+
+				if !bytes.Equal(w.Body.Bytes(), expect) {
+					t.Fatalf("expected error %s got %s", expect, w.Body.String())
+				}
+			})
+		})
 	}
 }

@@ -1,7 +1,7 @@
 package convert
 
 import (
-	"os"
+	"io"
 	"regexp"
 
 	"github.com/ollama/ollama/llm"
@@ -17,8 +17,6 @@ func (m *MixtralModel) GetTensors() error {
 		return err
 	}
 
-	m.Tensors = []llm.Tensor{}
-
 	pattern := `^blk\.[0-9]+\.attn_(?P<layer>q|k)\.weight$`
 	re, err := regexp.Compile(pattern)
 	if err != nil {
@@ -29,7 +27,7 @@ func (m *MixtralModel) GetTensors() error {
 		matches := re.FindAllStringSubmatch(l.Name, -1)
 		if len(matches) > 0 {
 			wt := l.WriterTo.(safetensorWriterTo)
-			wt.handler = mistralLayerHandler
+			wt.repacker = m.Repack
 			l.WriterTo = wt
 		}
 		m.Tensors = append(m.Tensors, l)
@@ -47,7 +45,7 @@ func (m *MixtralModel) LoadVocab() error {
 	return nil
 }
 
-func (m *MixtralModel) WriteGGUF() (string, error) {
+func (m *MixtralModel) WriteGGUF(ws io.WriteSeeker) error {
 	kv := llm.KV{
 		"general.architecture":          "llama",
 		"general.name":                  m.Name,
@@ -81,16 +79,9 @@ func (m *MixtralModel) WriteGGUF() (string, error) {
 		"tokenizer.ggml.add_eos_token":    false,
 	}
 
-	f, err := os.CreateTemp("", "ollama-gguf")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
+	return llm.NewGGUFV3(m.Params.ByteOrder).Encode(ws, kv, m.Tensors)
+}
 
-	mod := llm.NewGGUFV3(m.Params.ByteOrder)
-	if err := mod.Encode(f, kv, m.Tensors); err != nil {
-		return "", err
-	}
-
-	return f.Name(), nil
+func (m *MixtralModel) Repack(name string, data []float32, shape []uint64) ([]float32, error) {
+	return llamaRepack(name, m.Params, data, shape)
 }

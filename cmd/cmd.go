@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -19,23 +20,27 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/containerd/console"
-
+	"github.com/mattn/go-runewidth"
 	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/exp/slices"
 	"golang.org/x/term"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/auth"
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/progress"
 	"github.com/ollama/ollama/server"
+	"github.com/ollama/ollama/types/errtypes"
+	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
 )
 
@@ -54,12 +59,13 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 	p := progress.NewProgress(os.Stderr)
 	defer p.Stop()
 
-	modelfile, err := os.ReadFile(filename)
+	f, err := os.Open(filename)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
-	commands, err := parser.Parse(bytes.NewReader(modelfile))
+	modelfile, err := parser.ParseFile(f)
 	if err != nil {
 		return err
 	}
@@ -73,10 +79,10 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 	spinner := progress.NewSpinner(status)
 	p.Add(status, spinner)
 
-	for _, c := range commands {
-		switch c.Name {
+	for i := range modelfile.Commands {
+		switch modelfile.Commands[i].Name {
 		case "model", "adapter":
-			path := c.Args
+			path := modelfile.Commands[i].Args
 			if path == "~" {
 				path = home
 			} else if strings.HasPrefix(path, "~/") {
@@ -88,7 +94,7 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 			}
 
 			fi, err := os.Stat(path)
-			if errors.Is(err, os.ErrNotExist) && c.Name == "model" {
+			if errors.Is(err, os.ErrNotExist) && modelfile.Commands[i].Name == "model" {
 				continue
 			} else if err != nil {
 				return err
@@ -111,13 +117,7 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 				return err
 			}
 
-			name := c.Name
-			if c.Name == "model" {
-				name = "from"
-			}
-
-			re := regexp.MustCompile(fmt.Sprintf(`(?im)^(%s)\s+%s\s*$`, name, c.Args))
-			modelfile = re.ReplaceAll(modelfile, []byte("$1 @"+digest))
+			modelfile.Commands[i].Args = "@" + digest
 		}
 	}
 
@@ -145,9 +145,9 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	quantization, _ := cmd.Flags().GetString("quantization")
+	quantize, _ := cmd.Flags().GetString("quantize")
 
-	request := api.CreateRequest{Name: args[0], Modelfile: string(modelfile), Quantization: quantization}
+	request := api.CreateRequest{Name: args[0], Modelfile: modelfile.String(), Quantize: quantize}
 	if err := client.Create(cmd.Context(), &request, fn); err != nil {
 		return err
 	}
@@ -209,7 +209,7 @@ func tempZipFiles(path string) (string, error) {
 		// pytorch files might also be unresolved git lfs references; skip if they are
 		// covers pytorch_model-x-of-y.bin, pytorch_model.fp32-x-of-y.bin, pytorch_model.bin
 		files = append(files, pt...)
-	} else if pt, _ := glob(filepath.Join(path, "consolidated*.pth"), "application/octet-stream"); len(pt) > 0 {
+	} else if pt, _ := glob(filepath.Join(path, "consolidated*.pth"), "application/zip"); len(pt) > 0 {
 		// pytorch files might also be unresolved git lfs references; skip if they are
 		// covers consolidated.x.pth, consolidated.pth
 		files = append(files, pt...)
@@ -327,6 +327,18 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 	opts.Format = format
 
+	keepAlive, err := cmd.Flags().GetString("keepalive")
+	if err != nil {
+		return err
+	}
+	if keepAlive != "" {
+		d, err := time.ParseDuration(keepAlive)
+		if err != nil {
+			return err
+		}
+		opts.KeepAlive = &api.Duration{Duration: d}
+	}
+
 	prompts := args[1:]
 	// prepend stdin to the prompt if provided
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
@@ -355,6 +367,47 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	return generateInteractive(cmd, opts)
+}
+
+func errFromUnknownKey(unknownKeyErr error) error {
+	// find SSH public key in the error message
+	sshKeyPattern := `ssh-\w+ [^\s"]+`
+	re := regexp.MustCompile(sshKeyPattern)
+	matches := re.FindStringSubmatch(unknownKeyErr.Error())
+
+	if len(matches) > 0 {
+		serverPubKey := matches[0]
+
+		localPubKey, err := auth.GetPublicKey()
+		if err != nil {
+			return unknownKeyErr
+		}
+
+		if runtime.GOOS == "linux" && serverPubKey != localPubKey {
+			// try the ollama service public key
+			svcPubKey, err := os.ReadFile("/usr/share/ollama/.ollama/id_ed25519.pub")
+			if err != nil {
+				return unknownKeyErr
+			}
+			localPubKey = strings.TrimSpace(string(svcPubKey))
+		}
+
+		// check if the returned public key matches the local public key, this prevents adding a remote key to the user's account
+		if serverPubKey != localPubKey {
+			return unknownKeyErr
+		}
+
+		var msg strings.Builder
+		msg.WriteString(unknownKeyErr.Error())
+		msg.WriteString("\n\nYour ollama key is:\n")
+		msg.WriteString(localPubKey)
+		msg.WriteString("\nAdd your key at:\n")
+		msg.WriteString("https://ollama.com/settings/keys")
+
+		return errors.New(msg.String())
+	}
+
+	return unknownKeyErr
 }
 
 func PushHandler(cmd *cobra.Command, args []string) error {
@@ -404,6 +457,20 @@ func PushHandler(cmd *cobra.Command, args []string) error {
 
 	request := api.PushRequest{Name: args[0], Insecure: insecure}
 	if err := client.Push(cmd.Context(), &request, fn); err != nil {
+		if spinner != nil {
+			spinner.Stop()
+		}
+		if strings.Contains(err.Error(), "access denied") {
+			return errors.New("you are not authorized to push to this namespace, create the model under a namespace you own")
+		}
+		host := model.ParseName(args[0]).Host
+		isOllamaHost := strings.HasSuffix(host, ".ollama.ai") || strings.HasSuffix(host, ".ollama.com")
+		if strings.Contains(err.Error(), errtypes.UnknownOllamaKeyErrMsg) && isOllamaHost {
+			// the user has not added their ollama key to ollama.com
+			// re-throw an error with a more user-friendly message
+			return errFromUnknownKey(err)
+		}
+
 		return err
 	}
 
@@ -432,6 +499,52 @@ func ListHandler(cmd *cobra.Command, args []string) error {
 
 	table := tablewriter.NewWriter(os.Stdout)
 	table.SetHeader([]string{"NAME", "ID", "SIZE", "MODIFIED"})
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetHeaderLine(false)
+	table.SetBorder(false)
+	table.SetNoWhiteSpace(true)
+	table.SetTablePadding("\t")
+	table.AppendBulk(data)
+	table.Render()
+
+	return nil
+}
+
+func ListRunningHandler(cmd *cobra.Command, args []string) error {
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return err
+	}
+
+	models, err := client.ListRunning(cmd.Context())
+	if err != nil {
+		return err
+	}
+
+	var data [][]string
+
+	for _, m := range models.Models {
+		if len(args) == 0 || strings.HasPrefix(m.Name, args[0]) {
+			var procStr string
+			switch {
+			case m.SizeVRAM == 0:
+				procStr = "100% CPU"
+			case m.SizeVRAM == m.Size:
+				procStr = "100% GPU"
+			case m.SizeVRAM > m.Size || m.Size == 0:
+				procStr = "Unknown"
+			default:
+				sizeCPU := m.Size - m.SizeVRAM
+				cpuPercent := math.Round(float64(sizeCPU) / float64(m.Size) * 100)
+				procStr = fmt.Sprintf("%d%%/%d%% CPU/GPU", int(cpuPercent), int(100-cpuPercent))
+			}
+			data = append(data, []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, format.HumanTime(m.ExpiresAt, "Never")})
+		}
+	}
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"NAME", "ID", "SIZE", "PROCESSOR", "UNTIL"})
 	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
 	table.SetAlignment(tablewriter.ALIGN_LEFT)
 	table.SetHeaderLine(false)
@@ -620,6 +733,7 @@ type runOptions struct {
 	Images      []api.ImageData
 	Options     map[string]interface{}
 	MultiModal  bool
+	KeepAlive   *api.Duration
 }
 
 type displayResponseState struct {
@@ -632,7 +746,7 @@ func displayResponse(content string, wordWrap bool, state *displayResponseState)
 	if wordWrap && termWidth >= 10 {
 		for _, ch := range content {
 			if state.lineLength+1 > termWidth-5 {
-				if len(state.wordBuffer) > termWidth-10 {
+				if runewidth.StringWidth(state.wordBuffer) > termWidth-10 {
 					fmt.Printf("%s%c", state.wordBuffer, ch)
 					state.wordBuffer = ""
 					state.lineLength = 0
@@ -640,12 +754,22 @@ func displayResponse(content string, wordWrap bool, state *displayResponseState)
 				}
 
 				// backtrack the length of the last word and clear to the end of the line
-				fmt.Printf("\x1b[%dD\x1b[K\n", len(state.wordBuffer))
+				a := runewidth.StringWidth(state.wordBuffer)
+				if a > 0 {
+					fmt.Printf("\x1b[%dD", a)
+				}
+				fmt.Printf("\x1b[K\n")
 				fmt.Printf("%s%c", state.wordBuffer, ch)
-				state.lineLength = len(state.wordBuffer) + 1
+				chWidth := runewidth.RuneWidth(ch)
+
+				state.lineLength = runewidth.StringWidth(state.wordBuffer) + chWidth
 			} else {
 				fmt.Print(string(ch))
-				state.lineLength += 1
+				state.lineLength += runewidth.RuneWidth(ch)
+				if runewidth.RuneWidth(ch) >= 2 {
+					state.wordBuffer = ""
+					continue
+				}
 
 				switch ch {
 				case ' ':
@@ -712,6 +836,10 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 		Messages: opts.Messages,
 		Format:   opts.Format,
 		Options:  opts.Options,
+	}
+
+	if opts.KeepAlive != nil {
+		req.KeepAlive = opts.KeepAlive
 	}
 
 	if err := client.Chat(cancelCtx, req, fn); err != nil {
@@ -789,14 +917,15 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	}
 
 	request := api.GenerateRequest{
-		Model:    opts.Model,
-		Prompt:   opts.Prompt,
-		Context:  generateContext,
-		Images:   opts.Images,
-		Format:   opts.Format,
-		System:   opts.System,
-		Template: opts.Template,
-		Options:  opts.Options,
+		Model:     opts.Model,
+		Prompt:    opts.Prompt,
+		Context:   generateContext,
+		Images:    opts.Images,
+		Format:    opts.Format,
+		System:    opts.System,
+		Template:  opts.Template,
+		Options:   opts.Options,
+		KeepAlive: opts.KeepAlive,
 	}
 
 	if err := client.Generate(ctx, &request, fn); err != nil {
@@ -831,24 +960,27 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 }
 
 func RunServer(cmd *cobra.Command, _ []string) error {
-	host, port, err := net.SplitHostPort(strings.Trim(os.Getenv("OLLAMA_HOST"), "\"'"))
+	// retrieve the OLLAMA_HOST environment variable
+	ollamaHost, err := api.GetOllamaHost()
 	if err != nil {
-		host, port = "127.0.0.1", "11434"
-		if ip := net.ParseIP(strings.Trim(os.Getenv("OLLAMA_HOST"), "[]")); ip != nil {
-			host = ip.String()
-		}
+		return err
 	}
 
 	if err := initializeKeypair(); err != nil {
 		return err
 	}
 
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
+	ln, err := net.Listen("tcp", net.JoinHostPort(ollamaHost.Host, ollamaHost.Port))
 	if err != nil {
 		return err
 	}
 
-	return server.Serve(ln)
+	err = server.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+
+	return err
 }
 
 func initializeKeypair() error {
@@ -897,24 +1029,6 @@ func initializeKeypair() error {
 	return nil
 }
 
-//nolint:unused
-func waitForServer(ctx context.Context, client *api.Client) error {
-	// wait for the server to start
-	timeout := time.After(5 * time.Second)
-	tick := time.Tick(500 * time.Millisecond)
-	for {
-		select {
-		case <-timeout:
-			return errors.New("timed out waiting for server to start")
-		case <-tick:
-			if err := client.Heartbeat(ctx); err == nil {
-				return nil // server has started
-			}
-		}
-	}
-
-}
-
 func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
@@ -951,12 +1065,19 @@ func versionHandler(cmd *cobra.Command, _ []string) {
 	}
 }
 
-func appendHostEnvDocs(cmd *cobra.Command) {
-	const hostEnvDocs = `
+func appendEnvDocs(cmd *cobra.Command, envs []envconfig.EnvVar) {
+	if len(envs) == 0 {
+		return
+	}
+
+	envUsage := `
 Environment Variables:
-      OLLAMA_HOST        The host:port or base URL of the Ollama server (e.g. http://localhost:11434)
 `
-	cmd.SetUsageTemplate(cmd.UsageTemplate() + hostEnvDocs)
+	for _, e := range envs {
+		envUsage += fmt.Sprintf("      %-24s   %s\n", e.Name, e.Description)
+	}
+
+	cmd.SetUsageTemplate(cmd.UsageTemplate() + envUsage)
 }
 
 func NewCLI() *cobra.Command {
@@ -995,8 +1116,8 @@ func NewCLI() *cobra.Command {
 		RunE:    CreateHandler,
 	}
 
-	createCmd.Flags().StringP("file", "f", "Modelfile", "Name of the Modelfile (default \"Modelfile\")")
-	createCmd.Flags().StringP("quantization", "q", "", "Quantization level.")
+	createCmd.Flags().StringP("file", "f", "Modelfile", "Name of the Modelfile")
+	createCmd.Flags().StringP("quantize", "q", "", "Quantize model to this level (e.g. q4_0)")
 
 	showCmd := &cobra.Command{
 		Use:     "show MODEL",
@@ -1020,6 +1141,7 @@ func NewCLI() *cobra.Command {
 		RunE:    RunHandler,
 	}
 
+	runCmd.Flags().String("keepalive", "", "Duration to keep a model loaded (e.g. 5m)")
 	runCmd.Flags().Bool("verbose", false, "Show timings for response")
 	runCmd.Flags().Bool("insecure", false, "Use an insecure registry")
 	runCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
@@ -1031,15 +1153,6 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.ExactArgs(0),
 		RunE:    RunServer,
 	}
-	serveCmd.SetUsageTemplate(serveCmd.UsageTemplate() + `
-Environment Variables:
-
-    OLLAMA_HOST         The host:port to bind to (default "127.0.0.1:11434")
-    OLLAMA_ORIGINS      A comma separated list of allowed origins.
-    OLLAMA_MODELS       The path to the models directory (default is "~/.ollama/models")
-    OLLAMA_KEEP_ALIVE   The duration that models stay loaded in memory (default is "5m")
-    OLLAMA_DEBUG        Set to 1 to enable additional debug logging
-`)
 
 	pullCmd := &cobra.Command{
 		Use:     "pull MODEL",
@@ -1068,8 +1181,16 @@ Environment Variables:
 		PreRunE: checkServerHeartbeat,
 		RunE:    ListHandler,
 	}
+
+	psCmd := &cobra.Command{
+		Use:     "ps",
+		Short:   "List running models",
+		PreRunE: checkServerHeartbeat,
+		RunE:    ListRunningHandler,
+	}
+
 	copyCmd := &cobra.Command{
-		Use:     "cp SOURCE TARGET",
+		Use:     "cp SOURCE DESTINATION",
 		Short:   "Copy a model",
 		Args:    cobra.ExactArgs(2),
 		PreRunE: checkServerHeartbeat,
@@ -1084,6 +1205,10 @@ Environment Variables:
 		RunE:    DeleteHandler,
 	}
 
+	envVars := envconfig.AsMap()
+
+	envs := []envconfig.EnvVar{envVars["OLLAMA_HOST"]}
+
 	for _, cmd := range []*cobra.Command{
 		createCmd,
 		showCmd,
@@ -1091,10 +1216,33 @@ Environment Variables:
 		pullCmd,
 		pushCmd,
 		listCmd,
+		psCmd,
 		copyCmd,
 		deleteCmd,
+		serveCmd,
 	} {
-		appendHostEnvDocs(cmd)
+		switch cmd {
+		case runCmd:
+			appendEnvDocs(cmd, []envconfig.EnvVar{envVars["OLLAMA_HOST"], envVars["OLLAMA_NOHISTORY"]})
+		case serveCmd:
+			appendEnvDocs(cmd, []envconfig.EnvVar{
+				envVars["OLLAMA_DEBUG"],
+				envVars["OLLAMA_HOST"],
+				envVars["OLLAMA_KEEP_ALIVE"],
+				envVars["OLLAMA_MAX_LOADED_MODELS"],
+				envVars["OLLAMA_MAX_QUEUE"],
+				envVars["OLLAMA_MODELS"],
+				envVars["OLLAMA_NUM_PARALLEL"],
+				envVars["OLLAMA_NOPRUNE"],
+				envVars["OLLAMA_ORIGINS"],
+				envVars["OLLAMA_TMPDIR"],
+				envVars["OLLAMA_FLASH_ATTENTION"],
+				envVars["OLLAMA_LLM_LIBRARY"],
+				envVars["OLLAMA_MAX_VRAM"],
+			})
+		default:
+			appendEnvDocs(cmd, envs)
+		}
 	}
 
 	rootCmd.AddCommand(
@@ -1105,6 +1253,7 @@ Environment Variables:
 		pullCmd,
 		pushCmd,
 		listCmd,
+		psCmd,
 		copyCmd,
 		deleteCmd,
 	)

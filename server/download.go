@@ -221,7 +221,7 @@ func (b *blobDownload) downloadChunk(ctx context.Context, requestURL *url.URL, w
 		}
 		defer resp.Body.Close()
 
-		n, err := io.Copy(w, io.TeeReader(resp.Body, part))
+		n, err := io.CopyN(w, io.TeeReader(resp.Body, part), part.Size-part.Completed)
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			// rollback progress
 			b.Completed.Add(-n)
@@ -372,7 +372,7 @@ func downloadBlob(ctx context.Context, opts downloadOpts) error {
 			return err
 		}
 
-		// nolint: contextcheck
+		//nolint:contextcheck
 		go download.Run(context.Background(), requestURL, opts.regOpts)
 	}
 

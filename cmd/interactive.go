@@ -8,15 +8,17 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/exp/slices"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/progress"
 	"github.com/ollama/ollama/readline"
+	"github.com/ollama/ollama/types/errtypes"
 )
 
 type MultilineState int
@@ -56,6 +58,11 @@ func loadModel(cmd *cobra.Command, opts *runOptions) error {
 		Model:    opts.Model,
 		Messages: []api.Message{},
 	}
+
+	if opts.KeepAlive != nil {
+		chatReq.KeepAlive = opts.KeepAlive
+	}
+
 	err = client.Chat(cmd.Context(), chatReq, func(resp api.ChatResponse) error {
 		p.StopAndClear()
 		if len(opts.Messages) > 0 {
@@ -94,6 +101,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		fmt.Fprintln(os.Stderr, "  /show           Show model information")
 		fmt.Fprintln(os.Stderr, "  /load <model>   Load a session or model")
 		fmt.Fprintln(os.Stderr, "  /save <model>   Save your current session")
+		fmt.Fprintln(os.Stderr, "  /clear          Clear session context")
 		fmt.Fprintln(os.Stderr, "  /bye            Exit")
 		fmt.Fprintln(os.Stderr, "  /?, /help       Help for a command")
 		fmt.Fprintln(os.Stderr, "  /? shortcuts    Help for keyboard shortcuts")
@@ -131,6 +139,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		fmt.Fprintln(os.Stderr, "   Alt + f            Move forward (right) one word")
 		fmt.Fprintln(os.Stderr, "  Ctrl + k            Delete the sentence after the cursor")
 		fmt.Fprintln(os.Stderr, "  Ctrl + u            Delete the sentence before the cursor")
+		fmt.Fprintln(os.Stderr, "  Ctrl + w            Delete the word before the cursor")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "  Ctrl + l            Clear the screen")
 		fmt.Fprintln(os.Stderr, "  Ctrl + c            Stop the model from responding")
@@ -161,7 +170,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		fmt.Fprintln(os.Stderr, "  /set parameter repeat_penalty <float> How strongly to penalize repetitions")
 		fmt.Fprintln(os.Stderr, "  /set parameter repeat_last_n <int>    Set how far back to look for repetitions")
 		fmt.Fprintln(os.Stderr, "  /set parameter num_gpu <int>          The number of layers to send to the GPU")
-		fmt.Fprintln(os.Stderr, "  /set parameter stop \"<string>\", ...   Set the stop parameters")
+		fmt.Fprintln(os.Stderr, "  /set parameter stop <string> <string> ...   Set the stop parameters")
 		fmt.Fprintln(os.Stderr, "")
 	}
 
@@ -173,6 +182,10 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	if envconfig.NoHistory {
+		scanner.HistoryDisable()
 	}
 
 	fmt.Print(readline.StartBracketedPaste)
@@ -275,10 +288,21 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			fn := func(resp api.ProgressResponse) error { return nil }
 			err = client.Create(cmd.Context(), req, fn)
 			if err != nil {
-				fmt.Println("error: couldn't save model")
+				if strings.Contains(err.Error(), errtypes.InvalidModelNameErrMsg) {
+					fmt.Printf("error: The model name '%s' is invalid\n", args[1])
+					continue
+				}
 				return err
 			}
 			fmt.Printf("Created new model '%s'\n", args[1])
+			continue
+		case strings.HasPrefix(line, "/clear"):
+			opts.Messages = []api.Message{}
+			if opts.System != "" {
+				newMessage := api.Message{Role: "system", Content: opts.System}
+				opts.Messages = append(opts.Messages, newMessage)
+			}
+			fmt.Println("Cleared session context")
 			continue
 		case strings.HasPrefix(line, "/set"):
 			args := strings.Fields(line)

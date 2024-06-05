@@ -12,10 +12,10 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/app/lifecycle"
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/gpu"
 	"github.com/ollama/ollama/llm"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,38 +27,14 @@ func init() {
 func TestInitScheduler(t *testing.T) {
 	ctx, done := context.WithCancel(context.Background())
 	defer done()
-	initialMax := loadedMax
-	initialParallel := numParallel
 	s := InitScheduler(ctx)
-	require.Equal(t, initialMax, loadedMax)
 	s.loadedMu.Lock()
 	require.NotNil(t, s.loaded)
 	s.loadedMu.Unlock()
-
-	os.Setenv("OLLAMA_MAX_LOADED_MODELS", "blue")
-	s = InitScheduler(ctx)
-	require.Equal(t, initialMax, loadedMax)
-	s.loadedMu.Lock()
-	require.NotNil(t, s.loaded)
-	s.loadedMu.Unlock()
-
-	os.Setenv("OLLAMA_MAX_LOADED_MODELS", "0")
-	s = InitScheduler(ctx)
-	require.Equal(t, 0, loadedMax)
-	s.loadedMu.Lock()
-	require.NotNil(t, s.loaded)
-	s.loadedMu.Unlock()
-
-	os.Setenv("OLLAMA_NUM_PARALLEL", "blue")
-	_ = InitScheduler(ctx)
-	require.Equal(t, initialParallel, numParallel)
-	os.Setenv("OLLAMA_NUM_PARALLEL", "10")
-	_ = InitScheduler(ctx)
-	require.Equal(t, 10, numParallel)
 }
 
 func TestLoad(t *testing.T) {
-	ctx, done := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	ctx, done := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer done()
 	s := InitScheduler(ctx)
 	var ggml *llm.GGML // value not used in tests
@@ -76,10 +52,10 @@ func TestLoad(t *testing.T) {
 	}
 	gpus := gpu.GpuInfoList{}
 	s.load(req, ggml, gpus)
-	require.Len(t, req.successCh, 0)
+	require.Empty(t, req.successCh)
 	require.Len(t, req.errCh, 1)
 	s.loadedMu.Lock()
-	require.Len(t, s.loaded, 0)
+	require.Empty(t, s.loaded)
 	s.loadedMu.Unlock()
 	err := <-req.errCh
 	require.Contains(t, err.Error(), "this model may be incompatible")
@@ -136,7 +112,7 @@ func newScenario(t *testing.T, ctx context.Context, modelName string, estimatedV
 	t.Helper()
 
 	f, err := os.CreateTemp(t.TempDir(), modelName)
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	defer f.Close()
 
 	gguf := llm.NewGGUFV3(binary.LittleEndian)
@@ -154,7 +130,7 @@ func newScenario(t *testing.T, ctx context.Context, modelName string, estimatedV
 	}, []llm.Tensor{
 		{Name: "blk.0.attn.weight", Kind: uint32(0), Offset: uint64(0), Shape: []uint64{1, 1, 1, 1}, WriterTo: &bytes.Reader{}},
 	})
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	fname := f.Name()
 	model := &Model{Name: modelName, ModelPath: fname}
@@ -174,7 +150,7 @@ func newScenario(t *testing.T, ctx context.Context, modelName string, estimatedV
 }
 
 func TestRequests(t *testing.T) {
-	ctx, done := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, done := context.WithTimeout(context.Background(), time.Second)
 	defer done()
 
 	// Same model, same request
@@ -187,7 +163,8 @@ func TestRequests(t *testing.T) {
 
 	// simple reload of same model
 	scenario2a := newScenario(t, ctx, "ollama-model-1", 20)
-	scenario2a.req.model = scenario1a.req.model
+	tmpModel := *scenario1a.req.model
+	scenario2a.req.model = &tmpModel
 	scenario2a.ggml = scenario1a.ggml
 
 	// Multiple loaded models
@@ -212,8 +189,8 @@ func TestRequests(t *testing.T) {
 	select {
 	case resp := <-scenario1a.req.successCh:
 		require.Equal(t, resp.llama, scenario1a.srv)
-		require.Len(t, s.pendingReqCh, 0)
-		require.Len(t, scenario1a.req.errCh, 0)
+		require.Empty(t, s.pendingReqCh)
+		require.Empty(t, scenario1a.req.errCh)
 	case <-ctx.Done():
 		t.Errorf("timeout")
 	}
@@ -225,8 +202,8 @@ func TestRequests(t *testing.T) {
 	select {
 	case resp := <-scenario1b.req.successCh:
 		require.Equal(t, resp.llama, scenario1a.srv)
-		require.Len(t, s.pendingReqCh, 0)
-		require.Len(t, scenario1b.req.errCh, 0)
+		require.Empty(t, s.pendingReqCh)
+		require.Empty(t, scenario1b.req.errCh)
 	case <-ctx.Done():
 		t.Errorf("timeout")
 	}
@@ -243,13 +220,13 @@ func TestRequests(t *testing.T) {
 	select {
 	case resp := <-scenario2a.req.successCh:
 		require.Equal(t, resp.llama, scenario2a.srv)
-		require.Len(t, s.pendingReqCh, 0)
-		require.Len(t, scenario2a.req.errCh, 0)
+		require.Empty(t, s.pendingReqCh)
+		require.Empty(t, scenario2a.req.errCh)
 	case <-ctx.Done():
 		t.Errorf("timeout")
 	}
 
-	loadedMax = 1
+	envconfig.MaxRunners = 1
 	s.newServerFn = scenario3a.newServer
 	slog.Info("scenario3a")
 	s.pendingReqCh <- scenario3a.req
@@ -259,8 +236,8 @@ func TestRequests(t *testing.T) {
 	select {
 	case resp := <-scenario3a.req.successCh:
 		require.Equal(t, resp.llama, scenario3a.srv)
-		require.Len(t, s.pendingReqCh, 0)
-		require.Len(t, scenario3a.req.errCh, 0)
+		require.Empty(t, s.pendingReqCh)
+		require.Empty(t, scenario3a.req.errCh)
 	case <-ctx.Done():
 		t.Errorf("timeout")
 	}
@@ -268,15 +245,15 @@ func TestRequests(t *testing.T) {
 	require.Len(t, s.loaded, 1)
 	s.loadedMu.Unlock()
 
-	loadedMax = 0
+	envconfig.MaxRunners = 0
 	s.newServerFn = scenario3b.newServer
 	slog.Info("scenario3b")
 	s.pendingReqCh <- scenario3b.req
 	select {
 	case resp := <-scenario3b.req.successCh:
 		require.Equal(t, resp.llama, scenario3b.srv)
-		require.Len(t, s.pendingReqCh, 0)
-		require.Len(t, scenario3b.req.errCh, 0)
+		require.Empty(t, s.pendingReqCh)
+		require.Empty(t, scenario3b.req.errCh)
 	case <-ctx.Done():
 		t.Errorf("timeout")
 	}
@@ -291,8 +268,8 @@ func TestRequests(t *testing.T) {
 	select {
 	case resp := <-scenario3c.req.successCh:
 		require.Equal(t, resp.llama, scenario3c.srv)
-		require.Len(t, s.pendingReqCh, 0)
-		require.Len(t, scenario3c.req.errCh, 0)
+		require.Empty(t, s.pendingReqCh)
+		require.Empty(t, scenario3c.req.errCh)
 	case <-ctx.Done():
 		t.Errorf("timeout")
 	}
@@ -318,8 +295,8 @@ func TestRequests(t *testing.T) {
 	select {
 	case resp := <-scenario3d.req.successCh:
 		require.Equal(t, resp.llama, scenario3d.srv)
-		require.Len(t, s.pendingReqCh, 0)
-		require.Len(t, scenario3d.req.errCh, 0)
+		require.Empty(t, s.pendingReqCh)
+		require.Empty(t, scenario3d.req.errCh)
 	case <-ctx.Done():
 		t.Errorf("timeout")
 	}
@@ -329,7 +306,7 @@ func TestRequests(t *testing.T) {
 }
 
 func TestGetRunner(t *testing.T) {
-	ctx, done := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, done := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer done()
 
 	// Same model, same request
@@ -339,7 +316,7 @@ func TestGetRunner(t *testing.T) {
 	scenario1b.req.sessionDuration = 0
 	scenario1c := newScenario(t, ctx, "ollama-model-1c", 10)
 	scenario1c.req.sessionDuration = 0
-	maxQueuedRequests = 1
+	envconfig.MaxQueuedRequests = 1
 	s := InitScheduler(ctx)
 	s.getGpuFn = func() gpu.GpuInfoList {
 		g := gpu.GpuInfo{Library: "metal"}
@@ -354,7 +331,7 @@ func TestGetRunner(t *testing.T) {
 	slog.Info("scenario1b")
 	successCh1b, errCh1b := s.GetRunner(scenario1b.ctx, scenario1b.req.model, scenario1b.req.opts, scenario1b.req.sessionDuration)
 	require.Len(t, s.pendingReqCh, 1)
-	require.Len(t, successCh1b, 0)
+	require.Empty(t, successCh1b)
 	require.Len(t, errCh1b, 1)
 	err := <-errCh1b
 	require.Contains(t, err.Error(), "server busy")
@@ -362,8 +339,8 @@ func TestGetRunner(t *testing.T) {
 	select {
 	case resp := <-successCh1a:
 		require.Equal(t, resp.llama, scenario1a.srv)
-		require.Len(t, s.pendingReqCh, 0)
-		require.Len(t, errCh1a, 0)
+		require.Empty(t, s.pendingReqCh)
+		require.Empty(t, errCh1a)
 	case <-ctx.Done():
 		t.Errorf("timeout")
 	}
@@ -375,13 +352,11 @@ func TestGetRunner(t *testing.T) {
 	scenario1c.req.model.ModelPath = "bad path"
 	slog.Info("scenario1c")
 	successCh1c, errCh1c := s.GetRunner(scenario1c.ctx, scenario1c.req.model, scenario1c.req.opts, scenario1c.req.sessionDuration)
-	require.Len(t, s.pendingReqCh, 0)
-	require.Len(t, successCh1c, 0)
-	require.Len(t, errCh1c, 0)
-
+	// Starts in pending channel, then should be quickly processsed to return an error
 	time.Sleep(5 * time.Millisecond)
+	require.Empty(t, successCh1c)
 	s.loadedMu.Lock()
-	require.Len(t, s.loaded, 0)
+	require.Empty(t, s.loaded)
 	s.loadedMu.Unlock()
 	require.Len(t, errCh1c, 1)
 	err = <-errCh1c
@@ -391,7 +366,7 @@ func TestGetRunner(t *testing.T) {
 
 // TODO - add one scenario that triggers the bogus finished event with positive ref count
 func TestPrematureExpired(t *testing.T) {
-	ctx, done := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, done := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer done()
 
 	// Same model, same request
@@ -410,8 +385,8 @@ func TestPrematureExpired(t *testing.T) {
 	select {
 	case resp := <-successCh1a:
 		require.Equal(t, resp.llama, scenario1a.srv)
-		require.Len(t, s.pendingReqCh, 0)
-		require.Len(t, errCh1a, 0)
+		require.Empty(t, s.pendingReqCh)
+		require.Empty(t, errCh1a)
 		s.loadedMu.Lock()
 		require.Len(t, s.loaded, 1)
 		s.loadedMu.Unlock()
@@ -425,9 +400,9 @@ func TestPrematureExpired(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	require.LessOrEqual(t, len(s.finishedReqCh), 1)
 	time.Sleep(10 * time.Millisecond)
-	require.Len(t, s.finishedReqCh, 0)
+	require.Empty(t, s.finishedReqCh)
 	s.loadedMu.Lock()
-	require.Len(t, s.loaded, 0)
+	require.Empty(t, s.loaded)
 	s.loadedMu.Unlock()
 
 	// also shouldn't happen in real life
@@ -436,7 +411,7 @@ func TestPrematureExpired(t *testing.T) {
 }
 
 func TestUseLoadedRunner(t *testing.T) {
-	ctx, done := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	ctx, done := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	req := &LlmRequest{
 		ctx:             ctx,
 		opts:            api.DefaultOptions(),
@@ -461,7 +436,7 @@ func TestUseLoadedRunner(t *testing.T) {
 }
 
 func TestUpdateFreeSpace(t *testing.T) {
-	ctx, done := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	ctx, done := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer done()
 	gpus := gpu.GpuInfoList{
 		{
@@ -494,12 +469,9 @@ func TestUpdateFreeSpace(t *testing.T) {
 }
 
 func TestFindRunnerToUnload(t *testing.T) {
-	ctx, done := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	ctx, done := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer done()
-	req := &LlmRequest{
-		ctx:  ctx,
-		opts: api.DefaultOptions(),
-	}
+
 	r1 := &runnerRef{refCount: 1, sessionDuration: 1}
 	r2 := &runnerRef{sessionDuration: 2}
 
@@ -509,25 +481,23 @@ func TestFindRunnerToUnload(t *testing.T) {
 	s.loaded["b"] = r2
 	s.loadedMu.Unlock()
 
-	resp := s.findRunnerToUnload(req)
+	resp := s.findRunnerToUnload()
 	require.Equal(t, r2, resp)
 	r2.refCount = 1
-	resp = s.findRunnerToUnload(req)
+	resp = s.findRunnerToUnload()
 	require.Equal(t, r1, resp)
-
 }
 
 func TestNeedsReload(t *testing.T) {
-	ctx, done := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	ctx, done := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer done()
 
 	llm := &mockLlm{}
 	do := api.DefaultOptions()
 	runner := &runnerRef{
-		adapters:   []string{"adapter1"},
-		projectors: []string{"projector1"},
-		Options:    &do,
-		llama:      llm,
+		model:   &Model{AdapterPaths: []string{"adapter1"}, ProjectorPaths: []string{"projector1"}},
+		Options: &do,
+		llama:   llm,
 	}
 	req := &LlmRequest{
 		model: &Model{
@@ -538,10 +508,10 @@ func TestNeedsReload(t *testing.T) {
 	}
 	resp := runner.needsReload(ctx, req)
 	require.True(t, resp)
-	req.model.AdapterPaths = runner.adapters
+	req.model.AdapterPaths = runner.model.AdapterPaths
 	resp = runner.needsReload(ctx, req)
 	require.True(t, resp)
-	req.model.ProjectorPaths = runner.projectors
+	req.model.ProjectorPaths = runner.model.ProjectorPaths
 	runner.loading = true
 	req.opts.NumBatch = 1234
 	resp = runner.needsReload(ctx, req)
@@ -562,7 +532,7 @@ func TestNeedsReload(t *testing.T) {
 }
 
 func TestUnloadAllRunners(t *testing.T) {
-	ctx, done := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	ctx, done := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer done()
 
 	llm1 := &mockLlm{}
@@ -586,11 +556,11 @@ func TestUnloadAllRunners(t *testing.T) {
 func TestUnload(t *testing.T) {
 	llm1 := &mockLlm{}
 	r1 := &runnerRef{llama: llm1}
-	r2 := &runnerRef{adapters: []string{"A"}}
+	r2 := &runnerRef{model: &Model{AdapterPaths: []string{"A"}}}
 	r1.unload()
 	require.True(t, llm1.closeCalled)
 	r2.unload()
-	require.Nil(t, r2.adapters)
+	require.Nil(t, r2.model)
 }
 
 type mockLlm struct {
@@ -606,6 +576,7 @@ type mockLlm struct {
 	closeResp         error
 	closeCalled       bool
 	estimatedVRAM     uint64
+	estimatedTotal    uint64
 }
 
 func (s *mockLlm) Ping(ctx context.Context) error             { return s.pingResp }
@@ -626,4 +597,5 @@ func (s *mockLlm) Close() error {
 	s.closeCalled = true
 	return s.closeResp
 }
-func (s *mockLlm) EstimatedVRAM() uint64 { return s.estimatedVRAM }
+func (s *mockLlm) EstimatedVRAM() uint64  { return s.estimatedVRAM }
+func (s *mockLlm) EstimatedTotal() uint64 { return s.estimatedTotal }

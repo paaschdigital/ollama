@@ -13,82 +13,6 @@ type GGML struct {
 	model
 }
 
-const (
-	fileTypeF32 uint32 = iota
-	fileTypeF16
-	fileTypeQ4_0
-	fileTypeQ4_1
-	fileTypeQ4_1_F16
-	fileTypeQ8_0 uint32 = iota + 2
-	fileTypeQ5_0
-	fileTypeQ5_1
-	fileTypeQ2_K
-	fileTypeQ3_K_S
-	fileTypeQ3_K_M
-	fileTypeQ3_K_L
-	fileTypeQ4_K_S
-	fileTypeQ4_K_M
-	fileTypeQ5_K_S
-	fileTypeQ5_K_M
-	fileTypeQ6_K
-	fileTypeIQ2_XXS
-	fileTypeIQ2_XS
-	fileTypeQ2_K_S
-	fileTypeQ3_K_XS
-	fileTypeIQ3_XXS
-)
-
-func fileType(fileType uint32) string {
-	switch fileType {
-	case fileTypeF32:
-		return "F32"
-	case fileTypeF16:
-		return "F16"
-	case fileTypeQ4_0:
-		return "Q4_0"
-	case fileTypeQ4_1:
-		return "Q4_1"
-	case fileTypeQ4_1_F16:
-		return "Q4_1_F16"
-	case fileTypeQ8_0:
-		return "Q8_0"
-	case fileTypeQ5_0:
-		return "Q5_0"
-	case fileTypeQ5_1:
-		return "Q5_1"
-	case fileTypeQ2_K:
-		return "Q2_K"
-	case fileTypeQ3_K_S:
-		return "Q3_K_S"
-	case fileTypeQ3_K_M:
-		return "Q3_K_M"
-	case fileTypeQ3_K_L:
-		return "Q3_K_L"
-	case fileTypeQ4_K_S:
-		return "Q4_K_S"
-	case fileTypeQ4_K_M:
-		return "Q4_K_M"
-	case fileTypeQ5_K_S:
-		return "Q5_K_S"
-	case fileTypeQ5_K_M:
-		return "Q5_K_M"
-	case fileTypeQ6_K:
-		return "Q6_K"
-	case fileTypeIQ2_XXS:
-		return "IQ2_XXS"
-	case fileTypeIQ2_XS:
-		return "IQ2_XS"
-	case fileTypeQ2_K_S:
-		return "Q2_K_S"
-	case fileTypeQ3_K_XS:
-		return "Q3_K_XS"
-	case fileTypeIQ3_XXS:
-		return "IQ3_XXS"
-	default:
-		return "unknown"
-	}
-}
-
 type model interface {
 	KV() KV
 	Tensors() Tensors
@@ -121,12 +45,12 @@ func (kv KV) ParameterCount() uint64 {
 	return kv.u64("general.parameter_count")
 }
 
-func (kv KV) FileType() string {
+func (kv KV) FileType() fileType {
 	if u64 := kv.u64("general.file_type"); u64 > 0 {
 		return fileType(uint32(u64))
 	}
 
-	return "unknown"
+	return fileTypeUnknown
 }
 
 func (kv KV) BlockCount() uint64 {
@@ -182,7 +106,7 @@ type Layer map[string]*Tensor
 
 func (l Layer) size() (size uint64) {
 	for _, t := range l {
-		size += t.size()
+		size += t.Size()
 	}
 
 	return size
@@ -200,12 +124,12 @@ type Tensor struct {
 }
 
 func (t Tensor) blockSize() uint64 {
-	switch {
-	case t.Kind < 2:
+	switch t.Kind {
+	case 0, 1, 24, 25, 26, 27, 28, 30: // F32, F16, I8, I16, I32, I64, F64, BF16
 		return 1
-	case t.Kind < 10:
+	case 2, 3, 4, 5, 6, 7, 8, 9, 20: // Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, IQ4_NL
 		return 32
-	default:
+	default: // All others
 		return 256
 	}
 }
@@ -247,7 +171,29 @@ func (t Tensor) typeSize() uint64 {
 	case 17: // IQ2_XS
 		return 2 + 2*blockSize/8 + blockSize/32
 	case 18: // IQ3_XXS
-		return 2 + 3*blockSize/8
+		return 2 + blockSize/4 + blockSize/8
+	case 19: // IQ1_S
+		return 2 + blockSize/8 + blockSize/16
+	case 20: // IQ4_NL
+		return 2 + blockSize/2
+	case 21: // IQ3_S
+		return 2 + blockSize/4 + blockSize/8 + blockSize/32 + 4
+	case 22: // IQ2_S
+		return 2 + blockSize/4 + blockSize/16
+	case 23: // IQ4_XS
+		return 2 + 2 + blockSize/2 + blockSize/64
+	case 24: // I8
+		return 1
+	case 25: // I16
+		return 2
+	case 26: // I32
+		return 4
+	case 27: // I64
+		return 8
+	case 28: // F64
+		return 8
+	case 29: // IQ1_M
+		return blockSize/8 + blockSize/16 + blockSize/32
 	default:
 		return 0
 	}
@@ -261,7 +207,7 @@ func (t Tensor) parameters() uint64 {
 	return count
 }
 
-func (t Tensor) size() uint64 {
+func (t Tensor) Size() uint64 {
 	return t.parameters() * t.typeSize() / t.blockSize()
 }
 
@@ -285,6 +231,23 @@ const (
 )
 
 var ErrUnsupportedFormat = errors.New("unsupported model format")
+
+func DetectGGMLType(b []byte) string {
+	switch binary.LittleEndian.Uint32(b[:4]) {
+	case FILE_MAGIC_GGML:
+		return "ggml"
+	case FILE_MAGIC_GGMF:
+		return "ggmf"
+	case FILE_MAGIC_GGJT:
+		return "ggjt"
+	case FILE_MAGIC_GGLA:
+		return "ggla"
+	case FILE_MAGIC_GGUF_LE, FILE_MAGIC_GGUF_BE:
+		return "gguf"
+	default:
+		return ""
+	}
+}
 
 func DecodeGGML(rs io.ReadSeeker) (*GGML, int64, error) {
 	var magic uint32
@@ -347,7 +310,7 @@ func (llm GGML) GraphSize(context, batch uint64) (partialOffload, fullOffload ui
 			// mixtral 8x22b
 			ff := uint64(llm.KV()["llama.feed_forward_length"].(uint32))
 			partialOffload = max(
-				3*ffnGateExpsWeight.size()+4*batch*(2*ff+headsKV+embedding+context+embedding/heads*headsKV),
+				3*ffnGateExpsWeight.Size()+4*batch*(2*ff+headsKV+embedding+context+embedding/heads*headsKV),
 				4*(context*batch*heads+context*embedding/heads*headsKV+batch*1024+embedding/heads*headsKV*batch),
 			)
 		} else if ffnGateWeight, ok := layers["blk.0"]["ffn_gate.0.weight"]; ok {
@@ -388,7 +351,10 @@ func (llm GGML) GraphSize(context, batch uint64) (partialOffload, fullOffload ui
 			4*batch*(1+4*embedding+context+context*heads),
 		)
 
-		partialOffload = 4*batch*(2*embedding+vocab) + embedding*vocab*105/128
+		partialOffload = max(
+			4*batch*(2*embedding+vocab)+embedding*vocab*105/128,
+			4*batch*(2+3*embedding+context+context*heads),
+		)
 	case "stablelm":
 		fullOffload = 4 * batch * (context*(1+heads) + 3*embedding + 2)
 		partialOffload = max(
